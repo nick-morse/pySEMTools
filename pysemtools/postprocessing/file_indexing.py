@@ -556,6 +556,27 @@ def merge_index_files(comm, index_list="", output_fname="", sort_by_time=False, 
 
         consolidated_index = sorted_consolidated_index
 
+    # Recompute time intervals in merged timeline when sorted by time.
+    # This avoids carrying per-folder initial start times into merged indices.
+    if sort_by_time:
+        numeric_keys = sorted(
+            [int(key) for key in consolidated_index.keys() if str(key).isdigit()]
+        )
+
+        if len(numeric_keys) > 0:
+            if "statistics_start_time" in consolidated_index:
+                merged_start_time = consolidated_index["statistics_start_time"]
+            else:
+                merged_start_time = consolidated_index[numeric_keys[0]]["time"]
+
+            previous_time = merged_start_time
+            for key in numeric_keys:
+                entry = consolidated_index[key]
+                current_time = entry["time"]
+                entry["time_previous_output"] = previous_time
+                entry["time_interval"] = current_time - previous_time
+                previous_time = current_time
+
     logger.write("info", f"Writing consolidated index file: {output_fname}")
 
     write_index = True
@@ -568,8 +589,10 @@ def merge_index_files(comm, index_list="", output_fname="", sort_by_time=False, 
             logger.write("warning", f"Skipping writing index {output_fname}")
 
     if write_index:
-        with open(output_fname, "w") as outfile:
-            outfile.write(json.dumps(consolidated_index, indent=4))
+        if comm.Get_rank() == 0:
+            with open(output_fname, "w") as outfile:
+                outfile.write(json.dumps(consolidated_index, indent=4))
+        comm.Barrier()
 
     del logger
 

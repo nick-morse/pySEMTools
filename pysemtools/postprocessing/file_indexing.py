@@ -541,7 +541,7 @@ def merge_index_files(comm, index_list="", output_fname="", sort_by_time=False, 
 
         unsorted_key = np.array(unsorted_key)
 
-        sorted_indices = np.argsort(time)
+        sorted_indices = np.argsort(time, kind="stable")
         sorted_key = unsorted_key[sorted_indices]
 
         sorted_consolidated_index = {}

@@ -396,7 +396,7 @@ def compute_and_write_additional_pstat_fields(
     # read mesh and compute coefs
     pynekread(full_fname_mesh, comm, msh=msh, data_dtype=np.single)
     if if_do_dssum_on_derivatives:
-        msh_conn = MeshConnectivity(comm, msh, rel_tol=1e-5)
+        msh_conn = MeshConnectivity(comm, msh, rel_tol=1e-5, use_hashtable=True)
 
     if msh.gdim < 3:
         sys.exit("only 3D data is supported at the moment! "+
@@ -925,7 +925,7 @@ def interpolate_all_stat_and_pstat_fields_onto_points(
                  "you can convert your data to 3D using 'convert_2Dstats_to_3D'!")
 
     if if_do_dssum_before_interp:
-        msh_conn = MeshConnectivity(comm, msh, rel_tol=1e-5)
+        msh_conn = MeshConnectivity(comm, msh, rel_tol=1e-5, use_hashtable=True)
 
     if if_create_boundingBox_for_interp:
         xyz_max = np.max(xyz, axis=0)

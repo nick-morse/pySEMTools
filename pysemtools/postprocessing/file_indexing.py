@@ -520,6 +520,14 @@ def merge_index_files(comm, index_list="", output_fname="", sort_by_time=False, 
                     consolidated_index["simulation_start_time"] = index[key]
                 continue
 
+            if key == "statistics_start_time":
+                if (
+                    "statistics_start_time" not in consolidated_index
+                    or index[key] < consolidated_index["statistics_start_time"]
+                ):
+                    consolidated_index["statistics_start_time"] = index[key]
+                continue
+
             elif isinstance(index[key], dict):
                 if index[key]["path"] != "file_not_in_folder":
                     consolidated_index[consolidated_key] = index[key]
@@ -556,26 +564,27 @@ def merge_index_files(comm, index_list="", output_fname="", sort_by_time=False, 
 
         consolidated_index = sorted_consolidated_index
 
-    # Recompute time intervals in merged timeline when sorted by time.
-    # This avoids carrying per-folder initial start times into merged indices.
+    # Recompute time intervals only at job boundaries: when an entry's stored
+    # time_previous_output doesn't match the actual previous entry's time in
+    # the merged sequence. This fixes seam files without touching intervals
+    # that are already correct within a job.
     if sort_by_time:
         numeric_keys = sorted(
             [int(key) for key in consolidated_index.keys() if str(key).isdigit()]
         )
 
-        if len(numeric_keys) > 0:
-            if "statistics_start_time" in consolidated_index:
-                merged_start_time = consolidated_index["statistics_start_time"]
-            else:
-                merged_start_time = consolidated_index[numeric_keys[0]]["time"]
+        for i in range(1, len(numeric_keys)):
+            key = numeric_keys[i]
+            prev_key = numeric_keys[i - 1]
+            entry = consolidated_index[key]
+            prev_entry = consolidated_index[prev_key]
 
-            previous_time = merged_start_time
-            for key in numeric_keys:
-                entry = consolidated_index[key]
-                current_time = entry["time"]
-                entry["time_previous_output"] = previous_time
-                entry["time_interval"] = current_time - previous_time
-                previous_time = current_time
+            if "time_previous_output" not in entry:
+                continue
+
+            if entry["time_previous_output"] != prev_entry["time"]:
+                entry["time_previous_output"] = prev_entry["time"]
+                entry["time_interval"] = entry["time"] - prev_entry["time"]
 
     logger.write("info", f"Writing consolidated index file: {output_fname}")
 

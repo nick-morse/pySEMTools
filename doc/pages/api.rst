@@ -10,10 +10,15 @@ The presently included submodules are:
 
     pysemtools.cli
     pysemtools.comm
+    pysemtools.convert
     pysemtools.datatypes
     pysemtools.interpolation
     pysemtools.io.ppymech
     pysemtools.io.adios2
+    pysemtools.io.hdf
+    pysemtools.io.catalyst
+    pysemtools.io.nmsh
+    pysemtools.io.re2
     pysemtools.io.wrappers
     pysemtools.monitoring
     pysemtools.rom
@@ -39,6 +44,12 @@ comm
 .. automodule :: pysemtools.comm
     :members:
 
+convert
+~~~~~~~
+
+.. automodule :: pysemtools.convert
+    :members:
+
 datatypes
 ~~~~~~~~~
 
@@ -55,8 +66,9 @@ io
 ~~
 
 There are multiple interfaces to perform IO operations. The main one relates to NEk5000/Neko files. These are read by using the ppymech submodule. 
-It is also possible to use ADIOS2 to, for example, use the in-situ processing capabilities, like data streaming or compression. 
-Finally, a set of wrappers to read and write data in Nek or HDF5 format is also provided.
+It is also possible to use ADIOS2 to, for example, use the in-situ processing capabilities, like data streaming or compression.
+Support for HDF5 files in parallel is also provided, including VTKHDF files that can be shown in Paraview. 
+Finally, a set of wrappers to read and write data in a more user-friendly way is also included.
 
 
 ppymech
@@ -69,6 +81,30 @@ ADIOS2
 ^^^^^^
 
 .. automodule :: pysemtools.io.adios2
+    :members:
+
+HDF
+^^^
+
+.. automodule :: pysemtools.io.hdf
+    :members:
+
+Catalyst2
+^^^^^^^^^
+
+.. automodule :: pysemtools.io.catalyst
+    :members:
+
+nmsh
+^^^^
+
+.. automodule :: pysemtools.io.nmsh
+    :members:
+
+re2
+^^^
+
+.. automodule :: pysemtools.io.re2
     :members:
 
 wrappers

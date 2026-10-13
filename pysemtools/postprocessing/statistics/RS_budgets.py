@@ -173,7 +173,7 @@ def do_dssum_on_3comp_vector(dU_dxi, msh_conn, msh):
 ###########################################################################################
 
 #%% convert 2D statistics to 3D
-def convert_2Dstats_to_3D(stats2D_filename,stats3D_filename,datatype='single'):
+def convert_2Dstats_to_3D(stats2D_filename,stats3D_filename,stats2D_meshname=None,datatype='single'):
     from mpi4py import MPI 
     import numpy as np
     import warnings
@@ -198,8 +198,12 @@ def convert_2Dstats_to_3D(stats2D_filename,stats3D_filename,datatype='single'):
         data_type = np.double
         wdsz = 8
 
+    if stats2D_meshname==None:
+        stats2D_meshname = stats2D_filename
+
     # read mesh and fields
-    pynekread(stats2D_filename, comm, data_dtype=data_type, msh=msh, fld=fld)
+    pynekread(stats2D_meshname, comm, data_dtype=data_type, msh=msh)
+    pynekread(stats2D_filename, comm, data_dtype=data_type, fld=fld)
 
     # get the 
     field_names = return_list_of_vars_from_filename(stats2D_filename)
@@ -959,37 +963,24 @@ def interpolate_all_stat_and_pstat_fields_onto_points(
     #                 point_interpolator_type="multiple_point_legendre_numpy", \
     #                 global_tree_type="domain_binning" , \
     #                 max_pts = 256 )
+
+    probe_kwargs = {
+        "comm": comm,
+        "msh": msh,
+        "point_interpolator_type": "multiple_point_legendre_numpy",
+        "max_pts": 128,
+        "output_fname": interpolation_output_fname,
+    }
+    if find_points_tol is not None:
+        probe_kwargs["find_points_tol"] = find_points_tol
+
     if not if_pass_points_to_rank0_only:
-        probes = Probes(
-            comm,
-            probes=xyz,
-            msh=msh,
-            point_interpolator_type="multiple_point_legendre_numpy",
-            max_pts=128,
-            output_fname = interpolation_output_fname,
-            find_points_tol=find_points_tol
-        )
+        probes = Probes(probes=xyz, **probe_kwargs)
     else:
         if comm.Get_rank() == 0:
-            probes = Probes(
-                comm,
-                probes=xyz,
-                msh=msh,
-                point_interpolator_type="multiple_point_legendre_numpy",
-                max_pts=128,
-                output_fname = interpolation_output_fname,
-                find_points_tol=find_points_tol
-            )
+            probes = Probes(probes=xyz, **probe_kwargs)
         else:
-            probes = Probes(
-                comm,
-                probes=None,
-                msh=msh,
-                point_interpolator_type="multiple_point_legendre_numpy",
-                max_pts=128,
-                output_fname = interpolation_output_fname,
-                find_points_tol=find_points_tol
-            )
+            probes = Probes(probes=None, **probe_kwargs)
 
     ###########################################################################################
     for fname in these_names:

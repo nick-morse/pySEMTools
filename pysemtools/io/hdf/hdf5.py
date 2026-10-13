@@ -1,0 +1,526 @@
+""" Module that defines the hdf5 object to be used in pysemtools"""
+
+import os
+import h5py
+import numpy as np
+from mpi4py import MPI
+from ...monitoring.logger import Logger
+from ...comm.distribution import linear_distribution
+
+class HDF5File:
+    """
+    Class to write and read hdf5 files in parallel using h5py.
+        
+    Open an hdf5 file based on inputs.
+
+    Parameters
+    ----------
+    comm : MPI.Comm
+        MPI communicator.
+    fname : str
+        Name of the hdf5 file to read or write.
+    mode : str
+        Mode to open the file. Should be "r" for reading or "w" for
+        writing.
+    parallel : bool
+        Whether to use parallel I/O or not. 
+    """
+
+    def __init__(self, comm : MPI.Comm, fname: str, mode: str, parallel: bool):
+        
+        # Assign the communicator and assign empty attributes        
+        self.comm = comm
+        self.log = Logger(comm=comm, module_name="HDF5File")
+        
+        # Set attributes that are assigned when opening a file
+        self.mode = None
+        self.parallel = None
+        self.file = None
+        self.active_group = None
+        self.fname = None
+
+        # Some temporary variables to store
+        self.global_shape = None
+        self.local_shape = None
+        self.offset = None
+        self.count = None
+        self.slices = None
+        self.local_alloc_shape = None
+
+        # Open a file
+        self.open(fname, mode, parallel)
+ 
+    def set_active_group(self, group_name: str):
+        """ Set the active group to read or write data from. 
+        
+        This is useful to avoid having to specify the group every time a dataset is read or written.
+
+        Parameters
+        ----------
+        group_name : str
+            Name of the group to set as active. Can include the group path, e.g. "/group1/group2". 
+            If the group does not exist, it will be created if the file is opened in write mode, otherwise an error will be raised. 
+        """
+        
+        group_path = group_name.split("/")
+        group_path = [name for name in group_path if name != ""] # Remove empty strings
+        root = self.file["/"]
+                
+        for depth, name in enumerate(group_path):
+            if name not in root:
+                if self.mode == "w":
+                    root = root.create_group(name)
+                else:
+                    raise ValueError(f"Group {group_name} does not exist in the file")
+            else:
+                root = root[name]
+                
+        self.active_group = root
+
+    def open(self, fname: str, mode: str, parallel: bool):
+        """ Open an hdf5 file based on inputs. 
+        
+        This can be used to open a new file after closing the previous one.
+        
+        Parameters
+        ----------
+        fname : str
+            Name of the hdf5 file to read or write.
+        mode : str
+            Mode to open the file. Should be "r" for reading or "w" for
+            writing.
+        parallel : bool
+            Whether to use parallel I/O or not. If True, the file will be opened using
+            the MPI-IO driver. If False, the file will be opened using the default driver.
+        """
+
+        # Close the file if it is already open
+        self.close()
+
+        self.log.tic() 
+        self.fname = fname
+        if mode not in ["r", "w"]:
+            raise ValueError("Mode should be 'r' or 'w'")
+        else:
+            self.mode = mode
+ 
+        self.parallel = parallel
+        if self.comm.Get_size() < 2: 
+            self.parallel = False # Overwrite to serial if only one rank is used
+
+        if self.parallel:
+            self.file = h5py.File(self.fname, self.mode, driver='mpio', comm=self.comm)
+        else:
+            self.file = h5py.File(self.fname, self.mode)
+
+        parallel_str = "parallel" if self.parallel else "serial"
+        self.log.write("info", f"{self.fname} opened - mode {self.mode} - {parallel_str}")
+
+        # Set the active group to the root group
+        self.set_active_group("/")
+
+    def close(self, clean: bool = True):
+        """ Close the hdf5 file object 
+        
+        Parameters
+        ----------
+        clean : bool
+            Whether to clean the attributes that are assigned when opening a file. This is useful if the
+            file object will be reused to open another file after closing the current one. Default is False.
+        
+        """
+        if self.file is not None:
+            self.file.close()
+            self.file = None
+        else:
+            return
+
+        self.log.toc(message=f"{self.fname} closed")
+        if clean: 
+            # Set attributes that are assigned when opening a file
+            self.mode = None
+            self.parallel = None
+            self.active_group = None
+            self.fname = None
+
+            # Some temporary variables to store
+            self.global_shape = None
+            self.local_shape = None
+            self.offset = None
+            self.count = None
+            self.slices = None
+            self.local_alloc_shape = None
+
+
+    def read_dataset(self, dataset_name: str, dtype : np.dtype = np.double, distributed_axis: int = None, slices: list = None, as_array_list_in_file: bool = False, ignore_metadata: bool = False):
+        """ Read a dataset from the hdf5 file object
+
+        Parameters
+        ----------
+        dataset_name : str
+            Name of the dataset to read. Can include the group path, e.g. "/group1/group2/dataset".
+        dtype : np.dtype
+            Data type to read the dataset in. Default is np.double.
+        distributed_axis : int
+            Axis along which the data is distributed in parallel. This is required for parallel reading. Default is None.
+        slices : list
+            Optional. List of slices to read from the dataset. In case it is known
+        as_array_list_in_file : bool
+            Optional. default is False. Whether the data is stored as an array list in the file. This is useful if originally the data had a different shape
+            but was flattened to 1d before writing. This will use the shape attribute stored in the file to do the partioning
+            but will keep in mind that the data is stored as a 1d array to read properly.
+        ignore_metadata : bool
+            Optional. default is False. Force to read the data ingnoring any shape metadata.
+            This will just read the arrays as stored and will not try to assume an original shape
+
+        Returns
+        -------
+        local_data : np.ndarray
+            Data read from the file. This will be a local array with the shape determined by the
+            global shape of the dataset and the parallel distribution. If slices are provided, the shape will be determined by the slices.
+        """
+
+        if self.mode != "r":
+            raise ValueError("File is not opened in read mode")
+
+        if self.parallel and distributed_axis is None:
+            raise ValueError("Distributed axis must be specified for parallel reading")
+                
+        if slices is not None and len(slices) != self.active_group[dataset_name].ndim:
+            raise ValueError("Number of slices must match the number of dimensions of the dataset")
+
+        self.log.write("debug", f"Reading dataset {dataset_name} - dtype {dtype} - distributed_axis {distributed_axis}")
+
+        # Set the active group based on the data set name
+        if len(dataset_name.split("/")) > 1:
+            group_name = "/".join(dataset_name.split("/")[:-1]) # Exclude the dataset name from the full path
+            self.set_active_group(group_name)
+            dataset_name = dataset_name.split("/")[-1]
+
+        # Query the shape
+        if "shape" in self.active_group[dataset_name].attrs and not ignore_metadata:
+            global_shape = self.active_group[dataset_name].attrs["shape"]
+            shape_in_file = self.active_group[dataset_name].shape
+        else:
+            global_shape = self.active_group[dataset_name].shape
+            shape_in_file = self.active_group[dataset_name].shape
+
+        # ===========
+        # Serial read 
+        # ===========
+        if not self.parallel:
+            if slices is None:
+                local_data = self.active_group[dataset_name][:].reshape(global_shape).astype(dtype)
+            else:
+                local_data = self.active_group[dataset_name][tuple(slices)]
+        
+        # =============
+        # Parallel read 
+        # =============
+        else:
+
+            # Set slices
+            if slices is None:
+                self.set_read_slices_linear_lb(global_shape=global_shape, distributed_axis=distributed_axis, explicit_strides=as_array_list_in_file, shape_in_file=shape_in_file)
+            else:
+                self.set_read_slices_external(global_shape=global_shape, slices=slices)
+            
+            local_data = self.read_slices(dataset_name, dtype=dtype)
+
+        return local_data
+    
+    def set_read_slices_linear_lb(self, global_shape: tuple, distributed_axis: int, explicit_strides: bool = False, shape_in_file: list = None):
+        """Set the slices that should be read from the file.
+
+        Data is distributed in a linear load balanced way.
+
+        Parameters
+        ----------
+        global_shape : tuple
+            Shape of the global array to be read. This is required to determine the local shape and
+            the slices to read from the file.
+        distributed_axis : int
+            Axis along which the data is distributed in parallel. This is required to determine the local shape
+            and the slices to read from the file.
+        explicit_strides : bool
+            Whether to use explicit strides to read the data. This is useful if the data is stored
+            as 1D in the file but originally had a different shape.
+        """
+        # Perform a load balanced linear distribution along the distributed axis
+        local_distributed_axis_shape, offset = linear_distribution(
+            global_shape[distributed_axis], self.comm
+        )
+        count = local_distributed_axis_shape
+
+        # Update the offset and count to traverse the non distributed axes if explicit strides are used
+        if explicit_strides:
+            if shape_in_file is None:
+                raise ValueError("Shape in file must be provided if explicit strides are used")
+            # Determine which axes were merged
+            merged_axes = find_merged_axes(global_shape, shape_in_file) 
+            # This really only works relliably if distributed axis is 0 and is part of the merge
+            stride = 1
+            for i in range(len(global_shape)):
+                if i  != distributed_axis and merged_axes[i]:
+                    stride = stride * global_shape[i]
+            offset = offset * stride
+            count = count * stride
+
+        # Determine the local shape of the array to be read
+        local_shape = list(global_shape)
+        local_shape[distributed_axis] = local_distributed_axis_shape
+        local_shape = tuple(local_shape)
+
+        # build the slices to read
+        if explicit_strides:
+            slices = [slice(None)] * len(shape_in_file)
+            slices[distributed_axis] = slice(offset, offset + count)
+            local_alloc_shape = list(shape_in_file)
+            local_alloc_shape[distributed_axis] = count
+            local_alloc_shape = tuple(local_alloc_shape)
+        else:
+            slices = [slice(None)] * len(global_shape)
+            slices[distributed_axis] = slice(offset, offset + count)
+            local_alloc_shape = local_shape
+
+        # Store the global shape in case this info can be reused
+        self.global_shape = global_shape
+        self.offset = offset
+        self.count = count
+        self.slices = tuple(slices)
+        self.local_shape = local_shape
+        self.local_alloc_shape = local_alloc_shape
+    
+    def set_read_slices_external(self, global_shape: tuple, slices: list):
+        """Set the slices that should be read from the file based on external input.
+
+        slices need to be precomputed in this case
+        
+        Parameters
+        ----------
+        global_shape : tuple
+            Shape of the global array to be read.
+        slices : list
+            List of slices to read from the data set.    
+        """
+
+        # Local shape from slices
+        local_array_shape = []
+        for dim, slc in zip(global_shape, slices):
+            if isinstance(slc, slice):
+                start = 0 if slc.start is None else slc.start
+                stop = dim if slc.stop is None else slc.stop
+                local_array_shape.append(stop - start)
+
+        # Set the attributes
+        self.global_shape = global_shape
+        self.offset = None
+        self.count = None
+        self.slices = tuple(slices)
+        self.local_shape = tuple(local_array_shape)
+        self.local_alloc_shape = self.local_shape 
+
+    def read_slices(self, dataset_name: str, dtype : np.dtype = np.double):
+        """Read the slices hyperslabs from the file
+        
+        Parameters
+        ----------
+        dataset_name : str
+            Name of the dataset to read. Can include the group path, e.g. "/group1/group2/dataset".
+        dtype : np.dtype
+            Data type to read the dataset in. Default is np.double.
+
+        Returns
+        -------
+        local_data : np.ndarray
+            Data read from the file. This will be a local array with the shape determined by the
+            global shape of the dataset and the parallel distribution. If slices are provided, the shape will be determined by the slices.
+        """
+        if self.slices is None:
+            raise ValueError("Slices have not been set")
+        if self.local_alloc_shape is None:
+            raise ValueError("Local allocation shape is not set")
+        if self.local_shape is None:
+            raise ValueError("Local shape is not set")
+
+        local_data = np.empty(self.local_alloc_shape, dtype=dtype)
+        local_data[:] = self.active_group[dataset_name][self.slices]
+
+        return local_data.reshape(self.local_shape)
+
+    def write_dataset(self, dataset_name: str, data: np.ndarray, distributed_axis: int = None, extra_global_entries: list[int] = None, shape_in_ram: tuple = None):
+        """ Write a dataset to the hdf5 file object 
+
+        Parameters
+        ----------
+        dataset_name : str
+            Name of the dataset to write. Can include the group path, e.g. "/group1/group2/dataset".
+        data : np.ndarray
+            Data to write to the file.
+        distributed_axis : int
+            Axis along which the data is distributed in parallel. This is required for parallel writing. Default is None.
+        extra_global_entries : list[int]
+            Optional. List of extra entries to add to the global shape of the dataset. This is useful
+            if the ranks are writing a certain amount of data but the global array should be bigger than 
+            what they collectively write.
+        shape_in_ram : tuple
+            Optional. Shape of the data in RAM. This is useful if the data is stored in a different shape that
+            it originally had, for example, if it is stored in a 1d array but originally it had a different shape.
+            this will be the shape that is stored in the file in the attribute "shape" and can be used to reshape the data when reading it.
+        """
+
+        if self.mode != "w":
+            raise ValueError("File is not opened in write mode")
+
+        if self.parallel and distributed_axis is None:
+            raise ValueError("Distributed axis must be specified for parallel writing")
+        
+        self.log.write("debug", f"Writing dataset {dataset_name} - dtype {data.dtype} - distributed_axis {distributed_axis}")
+        
+        # Set the active group based on the data set name
+        if len(dataset_name.split("/")) > 1:
+            group_name = "/".join(dataset_name.split("/")[:-1]) # Exclude the dataset name from the full path
+            self.set_active_group(group_name)
+            dataset_name = dataset_name.split("/")[-1]
+
+        # ============
+        # Serial write 
+        # ============
+        if not self.parallel:
+            dset = self.active_group.create_dataset(dataset_name, data=data, dtype=data.dtype)
+            if shape_in_ram is not None:
+                dset.attrs["shape"] = shape_in_ram
+            else:
+                dset.attrs["shape"] = data.shape
+
+        # ==============
+        # Parallel write 
+        # ==============
+        else:
+            # Set slices 
+            self.set_write_slices(local_shape=data.shape, distributed_axis=distributed_axis, extra_global_entries=extra_global_entries)
+    
+            # Write the slices
+            self.write_slices(dataset_name, data, shape_in_file=shape_in_ram)
+ 
+    def set_write_slices(self, local_shape: tuple, distributed_axis: int, extra_global_entries: list[int] = None):
+        """Set the slices that should be written to the file.
+        
+        Obtain global shape from the local one
+
+        Parameters
+        ----------
+        local_shape : tuple
+            Shape of the local array to be written. This is required to determine the global shape
+            and the slices to write to the file.
+        distributed_axis : int
+            Axis along which the data is distributed in parallel.
+        extra_global_entries : list[int], optional
+            List of extra entries to add to the global shape of the dataset. This is useful
+            if the ranks are writing a certain amount of data but the global array should be bigger than
+            what they collectively write. Default is None.
+        """
+
+        # Set the local shape
+        local_distributed_axis_shape = local_shape[distributed_axis]
+
+        # Determine offset and count to write
+        offset = self.comm.scan(local_distributed_axis_shape) - local_distributed_axis_shape
+        count = local_distributed_axis_shape 
+        
+        # Determine the global shape of the array
+        global_distributed_axis_shape = self.comm.allreduce(local_distributed_axis_shape, op=MPI.SUM)
+        global_shape = list(local_shape)
+        global_shape[distributed_axis] = global_distributed_axis_shape
+        if extra_global_entries is not None:
+            for i, extra in enumerate(extra_global_entries):
+                global_shape[i] += extra
+        global_shape = tuple(global_shape)
+        
+        # Determine the slices where to write
+        slices = [slice(None)] * len(local_shape)
+        slices[distributed_axis] = slice(offset, offset + count)
+
+        # Store the info in the attributes
+        self.global_shape = global_shape
+        self.offset = offset
+        self.count = count
+        self.slices = tuple(slices)
+        self.local_shape = local_shape
+        self.local_alloc_shape = None
+        
+    def write_slices(self, dataset_name: str, data: np.ndarray, shape_in_file: tuple = None):
+        """Write the hyperslab to the file. 
+        
+        Perform the write operations
+
+        Parameters
+        ----------
+        dataset_name : str
+            Name of the dataset to write. Can include the group path, e.g. "/group1/group2/dataset".
+        data : np.ndarray
+            Data to write to the file. This should have the same shape as the local shape determined
+            by the set_write_slices method.
+        shape_in_file : tuple, optional
+            Shape of the data to be stored in the file. This is useful if the data is
+            stored in a different shape in the file than it is in RAM.
+        """
+        if self.slices is None:
+            raise ValueError("Slices have not been set")
+        if self.global_shape is None:
+            raise ValueError("Global shape is not set")
+
+        dset = self.active_group.create_dataset(dataset_name, shape=self.global_shape, dtype=data.dtype)
+        dset[self.slices] = data
+        if shape_in_file is not None:
+            dset.attrs["shape"] = shape_in_file
+        else:
+            dset.attrs["shape"] = self.global_shape
+
+def find_merged_axes(global_shape, shape_in_file):
+    """ Hleper function to determine which axis were merged
+    between two shapes"""
+    global_shape = tuple(global_shape)
+    shape_in_file = tuple(shape_in_file)
+
+    merged = [False] * len(global_shape)
+
+    i = 0  # index in global_shape
+    j = 0  # index in shape_in_file
+
+    while i < len(global_shape) and j < len(shape_in_file):
+        # Direct match: no merge
+        if global_shape[i] == shape_in_file[j]:
+            i += 1
+            j += 1
+            continue
+
+        # Otherwise try merging consecutive global axes
+        acc = global_shape[i]
+        start = i
+        i += 1
+
+        while i < len(global_shape) and acc < shape_in_file[j]:
+            acc *= global_shape[i]
+            i += 1
+
+        if acc != shape_in_file[j]:
+            raise ValueError(
+                f"Could not match global_shape={global_shape} "
+                f"to shape_in_file={shape_in_file}"
+            )
+
+        # Mark all axes in this merged block as merged
+        if i - start > 1:
+            for k in range(start, i):
+                merged[k] = True
+
+        j += 1
+
+    if i != len(global_shape) or j != len(shape_in_file):
+        raise ValueError(
+            f"Did not fully consume shapes: "
+            f"global_shape={global_shape}, shape_in_file={shape_in_file}"
+        )
+
+    return merged

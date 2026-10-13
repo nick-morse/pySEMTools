@@ -1,5 +1,7 @@
 """ Module that contains the class and methods to perform direct sampling on a field """
 
+from __future__ import annotations
+
 import random
 from mpi4py import MPI
 from ..monitoring.logger import Logger
@@ -11,7 +13,10 @@ import bz2
 import sys
 import h5py
 import os
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 import math
 
 class DiscreetLegendreTruncation:
@@ -20,9 +25,11 @@ class DiscreetLegendreTruncation:
     Class to perform direct sampling on a field in the SEM format
     """
 
-    def __init__(self, comm: MPI.Comm = None, dtype: np.dtype = np.double,  msh: Mesh = None, filename: str = None, max_elements_to_process: int = 256, bckend: str = "numpy"):
+    def __init__(self, comm: MPI.Comm = None, dtype: np.dtype = np.double,  msh: Mesh = None, filename: str = None, max_elements_to_process: int = 256, bckend: str = "numpy", coef: Coef = None):
         
         self.log = Logger(comm=comm, module_name="DirectSampler")
+        if bckend == "torch" and torch is None:
+            raise ImportError("The torch backend was requested, but PyTorch is not installed. Use bckend='numpy' or install torch.")
         
         if msh is not None:
             self.init_from_msh(msh, dtype=dtype, max_elements_to_process=max_elements_to_process)
@@ -50,6 +57,43 @@ class DiscreetLegendreTruncation:
                 for field in self.uncompressed_data.keys():
                     for data in self.uncompressed_data[field].keys():
                         self.uncompressed_data[field][data] = torch.tensor(self.uncompressed_data[field][data], dtype=self.dtype_d, device = self.device, requires_grad=False)
+
+        # Jacobian for coefficient-space weighted error accumulation.
+        self.coef = coef
+        self.jac = self._build_jac(msh=msh, coef=coef)
+        self.B = self._build_B(msh=msh, coef=coef)
+
+    def _build_jac(self, msh: Mesh = None, coef: Coef = None):
+        """
+        Use coef.jac if available, otherwise use unit weights.
+        """
+
+        if coef is not None and hasattr(coef, "jac"):
+            jac = coef.jac
+            if hasattr(jac, "detach"):
+                jac = jac.detach().cpu().numpy()
+            return np.asarray(jac)
+
+        if msh is not None:
+            return np.ones_like(msh.x, dtype=self.dtype)
+
+        return np.ones((self.nelv, self.lz, self.ly, self.lx), dtype=self.dtype)
+
+    def _build_B(self, msh: Mesh = None, coef: Coef = None):
+        """
+        Use coef.B if available, otherwise use unit weights.
+        """
+
+        if coef is not None and hasattr(coef, "B"):
+            B = coef.B
+            if hasattr(B, "detach"):
+                B = B.detach().cpu().numpy()
+            return np.asarray(B)
+
+        if msh is not None:
+            return np.ones_like(msh.x, dtype=self.dtype)
+
+        return np.ones((self.nelv, self.lz, self.ly, self.lx), dtype=self.dtype)
 
     def init_from_file(self, comm: MPI.Comm, filename: str, max_elements_to_process: int = 256):
         """
@@ -122,7 +166,7 @@ class DiscreetLegendreTruncation:
         self.uncompressed_data = {}
         self.compressed_data = {}
     
-    def sample_field(self, field: np.ndarray = None, field_name: str = "field", compression_method: str = "fixed_bitrate", bitrate: float = 1/2, max_samples_per_it: int = 1):
+    def sample_field(self, field: np.ndarray = None, field_name: str = "field", compression_method: str = "fixed_bitrate", bitrate: float = 1/2, target_error: float = None, max_samples_per_it: int = 1):
         
         self.log.write("info", "Sampling the field with options: covariance_method: {covariance_method}, compression_method: {compression_method}")
 
@@ -150,6 +194,27 @@ class DiscreetLegendreTruncation:
                 field_sampled = self._sample_fixed_bitrate_torch(field_hat, field_name, self.settings)
 
             self.uncompressed_data[f"{field_name}"]["field"] = field_sampled
+            self.log.write("info", f"Sampled_field saved in field uncompressed_data[\"{field_name}\"][\"field\"]")
+
+        elif compression_method == "fixed_error":
+            if target_error is None:
+                raise ValueError("target_error must be provided when compression_method='fixed_error'")
+            if target_error < 0:
+                raise ValueError("target_error must be non-negative")
+            if self.bckend != "numpy":
+                raise NotImplementedError("fixed_error sampling is currently implemented only for the numpy backend")
+
+            self.settings["compression"] = {
+                "method": compression_method,
+                "target_error": target_error,
+                "max_samples_per_it": max_samples_per_it,
+            }
+
+            self.log.write("info", f"Sampling the field using the fixed error method. using settings: {self.settings['compression']}")
+            field_sampled, sampling_stats = self._sample_fixed_error(field_hat, field_name, self.settings)
+
+            self.uncompressed_data[f"{field_name}"]["field"] = field_sampled
+            self.settings["compression"].update(sampling_stats)
             self.log.write("info", f"Sampled_field saved in field uncompressed_data[\"{field_name}\"][\"field\"]")
 
         else:
@@ -196,8 +261,9 @@ class DiscreetLegendreTruncation:
         except Exception:
             # Log that parallel HDF5 is not available and a folder will be created.
             self.log.write("info", "Parallel HDF5 not available; creating folder to store rank files.")
-            base_name, _ = os.path.splitext(filename)
-            folder_name = f"{base_name}_comp"
+            path_name = os.path.dirname(filename)
+            base_name, _ = os.path.splitext(os.path.basename(filename))
+            folder_name = os.path.join(path_name, f"{base_name}_comp")
             if rank == 0:
                 os.makedirs(folder_name, exist_ok=True)
             # Ensure all ranks wait until the folder has been created.
@@ -263,8 +329,9 @@ class DiscreetLegendreTruncation:
             else:
                 raise RuntimeError("Parallel HDF5 not supported")
         except Exception:
-            base_name, _ = os.path.splitext(filename)
-            folder_name = f"{base_name}_comp"
+            path_name = os.path.dirname(filename)
+            base_name, _ = os.path.splitext(os.path.basename(filename))
+            folder_name = os.path.join(path_name, f"{base_name}_comp")
             file_path = os.path.join(folder_name, f"{base_name}_rank_{rank}.h5")
             f = h5py.File(file_path, "r")
             mode = "non_parallel"
@@ -419,6 +486,82 @@ class DiscreetLegendreTruncation:
 
         # Reshape back to the original shape
         return y_truncated.reshape(field_hat.shape)
+
+    def _sample_fixed_error(self, field_hat: np.ndarray, field_name: str, settings: dict):
+        """
+        Iteratively remove the lowest-energy coefficients one by one per element,
+        while the weighted RMS error stays below the target threshold.
+        """
+
+        target_error = settings["compression"]["target_error"]
+        nelv = settings["mesh_information"]["nelv"]
+
+        y = field_hat.reshape(nelv, -1)
+        y_truncated = np.copy(y)
+        n_coeff = y.shape[1]
+
+        if self.jac is None:
+            jac_flat = np.ones_like(y, dtype=self.dtype)
+        else:
+            jac_flat = self.jac.reshape(nelv, -1)
+
+        if self.B is None:
+            B_flat = np.ones_like(y, dtype=self.dtype)
+        else:
+            B_flat = self.B.reshape(nelv, -1)
+
+        vol = np.sum(B_flat, axis=1)
+        vol = np.where(vol > 0, vol, 1.0)
+
+        achieved_error = np.zeros(nelv, dtype=self.dtype)
+        n_samples_kept = np.full(nelv, n_coeff, dtype=np.int32)
+
+        chunk_size_e = self.max_elements_to_process
+        n_chunks_e = math.ceil(nelv / chunk_size_e)
+
+        for chunk_id_e in range(n_chunks_e):
+            start_e = chunk_id_e * chunk_size_e
+            end_e = min((chunk_id_e + 1) * chunk_size_e, nelv)
+            elem_idx = np.arange(start_e, end_e)
+
+            y_chunk = y[elem_idx, :]
+            jac_chunk = jac_flat[elem_idx, :]
+            vol_chunk = vol[elem_idx]
+
+            coeff_sq = y_chunk * y_chunk
+
+            # Rank coefficients by coefficient-space energy (smallest first).
+            ind_low_to_high = np.argsort(coeff_sq, axis=1)
+
+            sorted_coeff_sq = np.take_along_axis(coeff_sq, ind_low_to_high, axis=1)
+            sorted_jac = np.take_along_axis(jac_chunk, ind_low_to_high, axis=1)
+
+            # Build cumulative weighted error per element for progressively removing
+            # 1, 2, 3, ... coefficients in sorted order.
+            cum_err_sq = np.cumsum(sorted_jac * sorted_coeff_sq, axis=1)
+            threshold_sq = (target_error * target_error) * vol_chunk[:, None]
+
+            removed = np.sum(cum_err_sq <= threshold_sq, axis=1).astype(np.int32)
+            n_samples_kept[elem_idx] = n_coeff - removed
+
+            last_idx = np.clip(removed - 1, 0, n_coeff - 1)
+            err_sq_at_removed = cum_err_sq[np.arange(elem_idx.size), last_idx]
+            err_sq_at_removed = np.where(removed > 0, err_sq_at_removed, 0.0)
+            achieved_error[elem_idx] = np.sqrt(err_sq_at_removed / vol_chunk)
+
+            remove_sorted = np.arange(n_coeff)[None, :] < removed[:, None]
+            remove_mask = np.zeros_like(y_chunk, dtype=bool)
+            remove_mask[np.arange(elem_idx.size)[:, None], ind_low_to_high] = remove_sorted
+            y_chunk_truncated = y_truncated[elem_idx, :].copy()
+            y_chunk_truncated[remove_mask] = 0
+            y_truncated[elem_idx, :] = y_chunk_truncated
+
+        stats = {
+            "avg_samples_kept": float(np.mean(n_samples_kept)),
+            "avg_achieved_error": float(np.mean(achieved_error)),
+        }
+
+        return y_truncated.reshape(field_hat.shape), stats
 
     def reconstruct_field(self, field_name: str = None):
         

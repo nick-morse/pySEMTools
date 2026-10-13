@@ -31,6 +31,10 @@ class Coef:
 
     apply_1d_operators : bool, optional
         If True, the 1D operators will be applied instead of building 3D operators. (Default value = True).
+    
+    store_multidimensional_operators : bool, optional
+        If True, the multidimensional operators will be stored in the object. (Default value = False).
+        Note that if apply_1d_operators is false, the multidimensional operators will be stored regardless of this option.
 
     Attributes
     ----------
@@ -74,17 +78,18 @@ class Coef:
     >>> coef = Coef(msh, comm)
     """
 
-    def __init__(self, msh, comm, get_area=False, apply_1d_operators=True, bckend = "numpy"):
+    def __init__(self, msh, comm, get_area=False, apply_1d_operators=True, bckend = "numpy", store_multidimensional_operators=False):
 
         self.log = Logger(comm=comm, module_name="Coef")
         self.log.tic()
 
-        self.log.write("info", "Initializing Coef object")
-        self.log.write("info", "Getting derivative matrices")
+        self.log.write("debug", "Initializing Coef object")
+        self.log.write("debug", "Getting derivative matrices")
 
         self.gdim = msh.gdim
         self.dtype = msh.x.dtype
         self.apply_1d_operators = apply_1d_operators
+        self.store_multidimensional_operators = store_multidimensional_operators
 
         self.bckend = bckend
         if bckend == 'torch':
@@ -127,7 +132,7 @@ class Coef:
                 self.dt = torch.as_tensor(self.dt, dtype=self.dtype_d, device=self.device)
             self.dn = torch.as_tensor(self.dn, dtype=self.dtype_d, device=self.device)
 
-        self.log.write("info", "Calculating the components of the jacobian")
+        self.log.write("debug", "Calculating the components of the jacobian")
 
         # Find the components of the jacobian per point
         # jac(x,y,z) = [dxdr, dxds, dxdt ; dydr, dyds, dydt; dzdr, dzds, dzdt]
@@ -180,7 +185,7 @@ class Coef:
         # Find the jacobian determinant, its inverse inverse and mass matrix (3D)
         # jac maps domain from xyz to rst -> dxyz =  jac * drst during integration
         self.log.write(
-            "info",
+            "debug",
             "Calculating the jacobian determinant and inverse of the jacobian matrix",
         )
         calculate_jacobian_inverse_and_determinant(self)
@@ -189,7 +194,7 @@ class Coef:
         # self.jac_inv = 1 / self.jac # This is not really used in the way we have it
 
         # Compute the mass matrix
-        self.log.write("info", "Calculating the mass matrix")
+        self.log.write("debug", "Calculating the mass matrix")
         self.B = self.jac * self.w3.reshape((msh.lz, msh.ly, msh.lx))
 
         # Get area stuff only if mesh is 3D
@@ -204,7 +209,7 @@ class Coef:
             if self.bckend == 'torch':
                 raise ValueError("The torch backend does not support facet area calculation yet.")
             
-            self.log.write("info", "Calculating area weights and normal vectors")
+            self.log.write("debug", "Calculating area weights and normal vectors")
 
             self.area = np.zeros((msh.nelv, 6, msh.ly, msh.lx), dtype=self.dtype)
             self.nx = np.zeros((msh.nelv, 6, msh.ly, msh.lx), dtype=self.dtype)
@@ -351,9 +356,26 @@ class Coef:
             self.ny[:, 5, :, :] = -cross[..., 1] / norm
             self.nz[:, 5, :, :] = -cross[..., 2] / norm
 
-        self.log.write("info", "Coef object initialized")
-        self.log.write("info", f"Coef data is of type: {self.B.dtype}")
-        self.log.toc()
+        if store_multidimensional_operators:
+
+            if self.gdim == 2:
+                self.dr_xd = np.kron(np.eye(msh.lx), self.dn)
+                self.ds_xd = np.kron(self.dn, np.eye(msh.ly))
+                self.v_xd = np.kron(self.v, self.v)
+                self.vinv_xd = np.kron(self.vinv, self.vinv)
+                self.w_xd = np.diag(self.w3.flatten())
+
+            elif self.gdim == 3:
+                self.dr_xd = np.kron(np.eye(msh.lx), np.kron(np.eye(msh.ly), self.dn))
+                self.ds_xd = np.kron(np.eye(msh.lx), np.kron(self.dn, np.eye(msh.lz)))
+                self.dt_xd = np.kron(self.dn, np.kron(np.eye(msh.ly), np.eye(msh.lz)))
+                self.v_xd = np.kron(self.v, np.kron(self.v, self.v))
+                self.vinv_xd = np.kron(self.vinv, np.kron(self.vinv, self.vinv))
+                self.w_xd = np.diag(self.w3.flatten())
+
+        self.log.write("debug", "Coef object initialized")
+        self.log.write("debug", f"Coef data is of type: {self.B.dtype}")
+        self.log.toc(message= f"Coef object initialized - dtype: {self.B.dtype}")
 
     def dudrst(self, field, direction="r"):
         """

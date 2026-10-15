@@ -356,7 +356,159 @@ def read_interpolated_stat_hdf5_fields(
 ################################################################################################
 ################################################################################################
 ################################################################################################
+# functions to rotate the raw (not yet mean-subtracted) fields into a new orthonormal basis and
+# average them, BEFORE the fluctuating quantities are formed in calculate_budgets_in_Cartesian
+################################################################################################
+
+# tensor kind of each *_struct field written by read_interpolated_stat_hdf5_fields
+# (see rotate_stat_struct_field in tensor_manipulations.py for the meaning of each kind)
+FLUID_STRUCT_FIELD_KINDS = {
+    'XYZ':        'coords',
+    'UVW':        'vec',
+    'UiUj':       'sym2',
+    'UiUjUk':     'sym3',
+    'Ui4':        'ui4',
+    'P':          'scalar',
+    'P2':         'scalar',
+    'P3':         'scalar',
+    'P4':         'scalar',
+    'PUi':        'vec',
+    'PGij':       'gen2',
+    'pseudoDiss': 'sym2',
+    'dUidxj':     'gen2',
+    'd2Uidx2':    'lap_vec',
+    'dPdx':       'vec',
+    'd2Pdx2':     'lap_scalar',
+    'dPUidxj':    'gen2',
+    'dUiUjdx':    'sym2_grad',
+    'd2UiUjdx2':  'lap_sym2',
+    'dUiUjUkdx':  'sym3_grad',
+}
+
+
+def rotate_and_average_struct_hdf5(
+        input_path,
+        output_path,
+        field_kinds,
+        copy_names,
+        basis_func,
+        av_func,
+        If_convert_to_single=False,
+        max_points_per_chunk=200000,
+        ):
+    """
+    Generic driver: rotate every *_struct field of input_path into the point-wise orthonormal basis
+    returned by basis_func(XYZ) -> (v1, v2, v3), apply av_func, and write the result with the same
+    dataset names to output_path. Datasets in copy_names are copied unchanged. Any other dataset
+    raises an error so that nothing is passed on unrotated.
+
+    The rotation is done in double precision. av_func takes and returns arrays of shape
+    (N0, N1, N2, ncomp); it should keep the 4 dimensions (e.g. np.mean(..., keepdims=True)).
+    If basis_func is None, no rotation is done (only averaging).
+    """
+    import h5py
+    import numpy as np
+    import time
+    import warnings
+    from pysemtools.postprocessing.statistics.tensor_manipulations import (
+        define_rotation_tensor_from_vectors,
+        rotate_stat_struct_field,
+    )
+
+    if av_func is None:
+        av_func = lambda x: x
+
+    with h5py.File(input_path, 'r') as input_file, h5py.File(output_path, 'w') as output_file:
+
+        names = list(input_file.keys())
+        for name in names:
+            if name in copy_names:
+                continue
+            if not (name.endswith('_struct') and name[:-len('_struct')] in field_kinds):
+                raise KeyError(f"Don't know how to rotate dataset '{name}' in {input_path}")
+
+        XYZ = np.array(input_file['XYZ_struct'], dtype=np.float64)
+        Nxyz = XYZ.shape[:3]
+        if basis_func is not None:
+            v1, v2, v3 = basis_func(XYZ)
+            Q = define_rotation_tensor_from_vectors(v1, v2, v3)
+        else:
+            Q = None
+
+        # rotation is point-wise, so do it in chunks along the 2nd dimension to limit memory use
+        n_per_slab = Nxyz[0] * Nxyz[2]
+        chunk = max(1, min(Nxyz[1], max_points_per_chunk // max(n_per_slab, 1)))
+
+        for name in names:
+            if name in copy_names:
+                output_file.create_dataset(name, data=input_file[name][()])
+                continue
+
+            kind = field_kinds[name[:-len('_struct')]]
+            print(f'rotating and averaging {name} ({kind})...')
+            start_time = time.time()
+
+            dset = input_file[name]
+            data = np.empty(dset.shape, dtype=np.float64)
+            for j0 in range(0, Nxyz[1], chunk):
+                j1 = min(j0 + chunk, Nxyz[1])
+                block = np.array(dset[:, j0:j1, ...], dtype=np.float64)
+                if Q is not None:
+                    block = rotate_stat_struct_field(block, kind, Q[:, j0:j1, ...])
+                data[:, j0:j1, ...] = block
+
+            if kind == 'ui4' and Q is not None:
+                warnings.warn(f'{name}: 4th order moments cannot be rotated with the available '
+                              'components, writing NaN')
+
+            data = av_func(data)
+            if If_convert_to_single:
+                data = data.astype(np.float32)
+            output_file.create_dataset(name, data=data)
+            print(f'Done in {time.time() - start_time:.2f} seconds.')
+
+
+def rotate_and_average_interpolated_stat_fields(
+        path_to_files='./',
+        input_filename='averaged_and_renamed_interpolated_fields.hdf5',
+        output_filename='rotated_and_averaged_interpolated_fields.hdf5',
+        basis_func=None,
+        av_func=None,
+        If_convert_to_single=False,
+        ):
+    """
+    Rotate the raw interpolated fluid statistics written by read_interpolated_stat_hdf5_fields into
+    the basis given by basis_func and then average them with av_func, so that the fluctuating
+    quantities (Reynolds stresses, budgets, ...) are formed from the averaged means afterwards by
+    calculate_budgets_in_Cartesian(input_filename=output_filename).
+
+    This is the correct order when averaging over a direction (e.g. azimuthal) that is only
+    homogeneous in a rotated basis: <uiuj> - <Ui><Uj> instead of <uiuj - UiUj>.
+
+    Notes:
+    - Second-derivative fields (d2Uidx2, d2UiUjdx2, d2Pdx2) are replaced by their rotated Laplacian
+      stored in the first derivative slot (zeros in the others), which preserves the sums over the
+      derivative direction used by the budgets.
+    - Ui4 cannot be rotated and is set to NaN.
+    - Momentum_convectionRes computed afterwards uses Cartesian index picks and is not meaningful.
+    """
+    rotate_and_average_struct_hdf5(
+        path_to_files + '/' + input_filename,
+        path_to_files + '/' + output_filename,
+        FLUID_STRUCT_FIELD_KINDS,
+        ['Rer_here'],
+        basis_func,
+        av_func,
+        If_convert_to_single=If_convert_to_single,
+    )
+
+
+################################################################################################
+################################################################################################
+################################################################################################
 # function to read the raw but averaged fields and calcuate the budgets in Cartesian coordinates
+# NOTE: all budget expressions are tensorial, so the same function gives the budgets in any
+#       orthonormal basis if the input was produced by rotate_and_average_interpolated_stat_fields
 ################################################################################################
 
 def calculate_budgets_in_Cartesian(
@@ -758,7 +910,7 @@ def calculate_budgets_in_Cartesian(
         ind_tripple[:, 2, 2] = (np.array([8, 9, 3]) - 1) * 3 + np.array([1, 2, 3])-1
 
         # Allocate memory
-        TurbTrans_ij = np.zeros((*Nxyz, 3, 3), dtype=np.float32)
+        TurbTrans_ij = np.zeros((*Nxyz, 3, 3), dtype=UVW.dtype)
 
         # Compute turbulent transport
 

@@ -170,7 +170,82 @@ def read_interpolated_scalar_stat_hdf5_fields(
 #####################################################################################
 #####################################################################################
 #####################################################################################
+# function to rotate the raw (not yet mean-subtracted) scalar fields into a new orthonormal
+# basis and average them, BEFORE the fluctuating quantities are formed
+#####################################################################################
+
+# tensor kind of each *_struct field written by read_interpolated_scalar_stat_hdf5_fields
+# (see rotate_stat_struct_field in tensor_manipulations.py for the meaning of each kind)
+SCALAR_STRUCT_FIELD_KINDS = {
+    "XYZ": "coords",
+    "S": "scalar",
+    "S2": "scalar",
+    "S3": "scalar",
+    "S4": "scalar",
+    "PS": "scalar",
+    "UiS": "vec",
+    "UiS2": "vec",
+    "UiUjS": "sym2",
+    "PdSdxi": "vec",
+    "UidSdxj": "gen2",
+    "SdUidxj": "gen2",
+    "SDiss": "sdiss",
+    "dSdxj": "vec",
+    "d2Sdxj2": "lap_scalar",
+    "dS2dxj": "vec",
+    "d2S2dxj2": "lap_scalar",
+    "dUiSdxj": "gen2",
+    "dUjS2dxj": "scalar",
+    "dUiUjSdxj": "vec",
+    "dPSdxj": "vec",
+    "dUidSdxjdxj": "vec",
+    "dSdUidxjdxj": "vec",
+}
+
+
+def rotate_and_average_interpolated_scalar_stat_fields(
+    path_to_files="./",
+    input_filename="averaged_and_renamed_interpolated_scalar_fields.hdf5",
+    output_filename="rotated_and_averaged_interpolated_scalar_fields.hdf5",
+    basis_func=None,
+    av_func=None,
+    If_convert_to_single=False,
+):
+    """
+    Scalar counterpart of rotate_and_average_interpolated_stat_fields: rotate the raw interpolated
+    scalar statistics written by read_interpolated_scalar_stat_hdf5_fields into the basis given by
+    basis_func, then average them with av_func.
+
+    calculate_scalar_budgets_in_Cartesian must then be called with this output as
+    input_scalar_filename and with the fluid file processed by
+    rotate_and_average_interpolated_stat_fields (same basis_func and av_func) as
+    input_fluid_filename.
+
+    Second-derivative fields (d2Sdxj2, d2S2dxj2) are replaced by their Laplacian stored in the
+    first derivative slot (zeros in the others), which preserves the sums used by the budgets.
+    """
+    from pysemtools.postprocessing.statistics.RS_budgets_interpolatedPoints_notMPI import (
+        rotate_and_average_struct_hdf5,
+    )
+
+    rotate_and_average_struct_hdf5(
+        path_to_files + "/" + input_filename,
+        path_to_files + "/" + output_filename,
+        SCALAR_STRUCT_FIELD_KINDS,
+        ["Rer_here", "Prt_here"],
+        basis_func,
+        av_func,
+        If_convert_to_single=If_convert_to_single,
+    )
+
+
+# %%
+#####################################################################################
+#####################################################################################
+#####################################################################################
 # function to read the raw but averaged fields and calcuate the scalar budgets in Cartesian coordinates
+# NOTE: all budget expressions are tensorial, so the same function gives the budgets in any
+#       orthonormal basis if the inputs were produced by the rotate_and_average_* functions
 # the fluid statistics are also needed to calculate some terms in the budgets
 #####################################################################################
 def calculate_scalar_budgets_in_Cartesian(

@@ -206,22 +206,19 @@ path_to_files   = "./"
 Reynolds_number     = 1 / 0.0000530504 
 
 If_convert_to_single = True     # converts the statiscs/budegts data into single precision
-If_average           = True     # calculate average in space
+If_average           = False    # no averaging of the Cartesian components, see step 3.75
 
 if comm.Get_rank() == 0:
     Nstruct     = Nstruct_from_function # structured formation of the interpolation mesh
 
-fname_averaged  = 'averaged_and_renamed_interpolated_fields.hdf5'   # name of the hdf5 written after rehsaping into structured formation and averaging in space
+fname_raw       = 'renamed_interpolated_fields.hdf5'                 # name of the hdf5 written after rehsaping into structured formation
+fname_averaged  = 'rotated_and_averaged_interpolated_fields.hdf5'    # name of the hdf5 written after rotating and averaging in space
 fname_budget    = "pstat3d_format.hdf5"     # name of the hdf5 file containing calculated budgets
 
-#%% step 3.5: perform averaging on the interpolated fields
+#%% step 3.5: reshape the interpolated fields into the structured formation
 # NOTE: the use of Reynolds number assumes all fields are in non-dimensional form
 #       this should be fixed later
 from pysemtools.postprocessing.statistics.RS_budgets_interpolatedPoints_notMPI import read_interpolated_stat_hdf5_fields
-
-def av_func(x):
-    import numpy as np
-    return np.mean(x, axis=2, keepdims=True) * np.ones((*x.shape[:2], 6,x.shape[3]))
 
 if comm.Get_rank() == 0:
     read_interpolated_stat_hdf5_fields( 
@@ -230,12 +227,30 @@ if comm.Get_rank() == 0:
             If_average , 
             If_convert_to_single , 
             Nstruct , 
-            av_func , 
-            output_fname = fname_averaged
+            None , 
+            output_fname = fname_raw
             )
 
-#%% step 4: calciate budgets from interpolated and averged fields
-# NOTE: budgets are done in Cartesian cooridnates
+#%% step 3.75: rotate the raw fields into cylindrical coordinates and average them in the homogeneous
+# directions (azimuthal and streamwise) BEFORE the fluctuating quantities are formed, so that
+# e.g. Rij = <uiuj> - <Ui><Uj> with the averaged mean velocity
+from pysemtools.postprocessing.statistics.RS_budgets_interpolatedPoints_notMPI import rotate_and_average_interpolated_stat_fields
+
+def av_func(x):
+    import numpy as np
+    return np.mean(x, axis=(1,2), keepdims=True)
+
+if comm.Get_rank() == 0:
+    rotate_and_average_interpolated_stat_fields(
+            path_to_files   = path_to_files ,
+            input_filename  = fname_raw ,
+            output_filename = fname_averaged ,
+            basis_func      = define_cylindrical_coord_system_vectors ,
+            av_func         = av_func )
+
+#%% step 4: calculate budgets from the rotated and averaged fields
+# NOTE: the budget terms are tensorial, so they are obtained in the same (cylindrical) coordinates
+#       as the input fields
 # NOTE: this part uses Re number, meaning it assumes fields are in non-dimensional form
 from pysemtools.postprocessing.statistics.RS_budgets_interpolatedPoints_notMPI import calculate_budgets_in_Cartesian
 if comm.Get_rank() == 0:
@@ -244,17 +259,11 @@ if comm.Get_rank() == 0:
             input_filename  = fname_averaged ,
             output_filename = fname_budget )
 
-#%% step 5: rotate fields and perform additional averaging 
-# NOTE: not properly scripted yet, for demonstraiton purposes only
+#%% step 5: plot the results, which are already in cylindrical coordinates and averaged
 import h5py
 import pandas as pd
 import numpy as np
 from matplotlib import pyplot as plt
-
-from pysemtools.postprocessing.statistics.tensor_manipulations import rotate_6c2D_tensor
-from pysemtools.postprocessing.statistics.tensor_manipulations import rotate_vector
-from pysemtools.postprocessing.statistics.tensor_manipulations import define_rotation_tensor_from_vectors
-from pysemtools.postprocessing.statistics.tensor_manipulations import rotate_2D_tensor
 
 path_to_refdata     = '/lustre/iwst/iwst088h/ROUGH/PIPE/Re1000/tests/4pi_smooth/'
 fnames_refdata_vel  = 'PIPE_Re1K_MEAN.dat'
@@ -267,54 +276,28 @@ input_filename = path_to_files+'/'+fname_budget
 if comm.Get_rank() == 0:
     
     with h5py.File(input_filename, "r") as input_file:
-        XYZ         = np.array(input_file['XYZ'])
-        v1,v2,v3    = define_cylindrical_coord_system_vectors(XYZ)
-        Q           = define_rotation_tensor_from_vectors(v1,v2,v3)
-        Qtrans      = np.transpose(Q,axes=(0,1,2 , 4,3 ))
-        Nxyz        = XYZ.shape
+        # coordinates of the interpolation points before averaging, shape (Nr, Ntheta, Nz, 3)
+        with h5py.File(path_to_files+'/'+fname_raw, "r") as raw_file:
+            XYZ = np.array(raw_file['XYZ_struct'])
 
-        UVW     = np.array(input_file['UVW'])
-        Rij     = np.array(input_file['Rij'])  
-        dUidXj  = np.array(input_file['dUidXj'])
+        # the fields have shape (Nr, 1, 1, ...) after averaging
+        Nxyz    = np.array(input_file['UVW']).shape
 
-        Prod_ij         = np.array(input_file['Prod_ij']) 
-        Diss_ij         = np.array(input_file['Diss_ij'])
-        PRS_ij          = np.array(input_file['PRS_ij']) 
-        Conv_ij         = np.array(input_file['Conv_ij']) 
-        PressTrans_ij   = np.array(input_file['PressTrans_ij']) 
-        TurbTrans_ij    = np.array(input_file['TurbTrans_ij']) 
-        VelPressGrad_ij = np.array(input_file['VelPressGrad_ij']) 
-        ViscDiff_ij     = np.array(input_file['ViscDiff_ij'])
-
-        UVW     = rotate_vector(UVW,Qtrans,Q)
-        UVW     = np.mean( np.mean( UVW ,axis=1 ),axis=1)
-
-        Rij             = rotate_6c2D_tensor(Rij,Qtrans,Q)
-        Prod_ij         = rotate_6c2D_tensor(Prod_ij,Qtrans,Q)
-        Diss_ij         = rotate_6c2D_tensor(Diss_ij,Qtrans,Q)
-        PRS_ij          = rotate_6c2D_tensor(PRS_ij,Qtrans,Q)
-        Conv_ij         = rotate_6c2D_tensor(Conv_ij,Qtrans,Q)
-        PressTrans_ij   = rotate_6c2D_tensor(PressTrans_ij,Qtrans,Q)
-        TurbTrans_ij    = rotate_6c2D_tensor(TurbTrans_ij,Qtrans,Q)
-        VelPressGrad_ij = rotate_6c2D_tensor(VelPressGrad_ij,Qtrans,Q)
-        ViscDiff_ij     = rotate_6c2D_tensor(ViscDiff_ij,Qtrans,Q)
-        
-
-        Rij             = np.mean( np.mean( Rij ,axis=1 ),axis=1)
-        Prod_ij         = np.mean( np.mean( Prod_ij ,axis=1 ),axis=1)
-        Diss_ij         = np.mean( np.mean( Diss_ij ,axis=1 ),axis=1)
-        PRS_ij          = np.mean( np.mean( PRS_ij ,axis=1 ),axis=1)
-        Conv_ij         = np.mean( np.mean( Conv_ij ,axis=1 ),axis=1)
-        PressTrans_ij   = np.mean( np.mean( PressTrans_ij ,axis=1 ),axis=1)
-        TurbTrans_ij    = np.mean( np.mean( TurbTrans_ij ,axis=1 ),axis=1)
-        VelPressGrad_ij = np.mean( np.mean( VelPressGrad_ij ,axis=1 ),axis=1)
-        ViscDiff_ij     = np.mean( np.mean( ViscDiff_ij ,axis=1 ),axis=1)
+        UVW             = np.array(input_file['UVW'])[:,0,0]
+        Rij             = np.array(input_file['Rij'])[:,0,0]
+        Prod_ij         = np.array(input_file['Prod_ij'])[:,0,0]
+        Diss_ij         = np.array(input_file['Diss_ij'])[:,0,0]
+        PRS_ij          = np.array(input_file['PRS_ij'])[:,0,0]
+        Conv_ij         = np.array(input_file['Conv_ij'])[:,0,0]
+        PressTrans_ij   = np.array(input_file['PressTrans_ij'])[:,0,0]
+        TurbTrans_ij    = np.array(input_file['TurbTrans_ij'])[:,0,0]
+        VelPressGrad_ij = np.array(input_file['VelPressGrad_ij'])[:,0,0]
+        ViscDiff_ij     = np.array(input_file['ViscDiff_ij'])[:,0,0]
 
         Res_ij = Prod_ij + Diss_ij + PRS_ij + Conv_ij + PressTrans_ij + TurbTrans_ij + ViscDiff_ij 
         
-        dUidXj  = np.reshape( dUidXj , (Nxyz[0],Nxyz[1],Nxyz[2],3,3) , order="F" )
-        dUidXj  = rotate_2D_tensor(dUidXj , Qtrans,Q)
-        dUidXj  = np.mean( np.mean( dUidXj ,axis=1 ),axis=1)
+        dUidXj  = np.array(input_file['dUidXj'])
+        dUidXj  = np.reshape( dUidXj , (Nxyz[0],Nxyz[1],Nxyz[2],3,3) , order="F" )[:,0,0]
 
 
         # Rer     = 1 / 0.0000530504 # 
